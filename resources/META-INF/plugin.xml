@@ -1,0 +1,37 @@
+<idea-plugin>
+  <id>ir.ac.um.AndroidInstrumenter</id>
+  <name>GUITestGenerator</name>
+  <version>1.0</version>
+  <vendor email="Yarifard@mail.um.ac.ir" url="http://www.um.ac.ir">Ferdowsi University</vendor>
+
+  <description><![CDATA[
+    This plugin has been developed to generate GUI test cases for<br>
+    <em>Android apps</em>
+    ]]></description>
+
+  <!-- please see https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html
+       on how to target different products -->
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.lang</depends>
+  <depends>com.intellij.modules.java</depends>
+
+
+
+  <extensions defaultExtensionNs="com.intellij">
+    <!-- Add your extensions here -->
+    <toolWindow id = "AndroidInstrumenter"
+                anchor="bottom"
+                icon="/images/Instrumenter.png"
+                factoryClass="ir.ac.um.AndroidInstrumenter.ui.TestGeneratorToolWindowFactory"></toolWindow>
+  </extensions>
+
+  <actions>
+    <!-- Add your actions here -->
+    <action id="ir.ac.um.AndroidInstrumenter" class="ir.ac.um.AndroidInstrumenter.StartAction"
+            text="Instrument Android App"
+            description="Generate GUI Test Cases for Android apps">
+      <add-to-group group-id="ToolsMenu" anchor="first"/>
+      <keyboard-shortcut keymap="$default" first-keystroke="ctrl shift D"/>
+    </action>
+  </actions>
+</idea-plugin>

@@ -1,0 +1,12 @@
+<component name="libraryTable">
+  <library name="3.23">
+    <CLASSES>
+      <root url="file://$MAVEN_REPOSITORY$/com/github/javaparser/javaparser-core/3.23.0" />
+      <root url="file://$MAVEN_REPOSITORY$/com/github/javaparser/javaparser-core-generators/3.23.0" />
+    </CLASSES>
+    <JAVADOC />
+    <SOURCES />
+    <jarDirectory url="file://$MAVEN_REPOSITORY$/com/github/javaparser/javaparser-core-generators/3.23.0" recursive="false" />
+    <jarDirectory url="file://$MAVEN_REPOSITORY$/com/github/javaparser/javaparser-core/3.23.0" recursive="false" />
+  </library>
+</component>

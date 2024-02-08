@@ -1,0 +1,1623 @@
+package ir.ac.um.AndroidInstrumenter.Method;
+
+import com.github.javaparser.StaticJavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import com.github.javaparser.ast.Modifier;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.*;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.stmt.*;
+import ir.ac.um.AndroidInstrumenter.Analysis.Project.ProjectInformation;
+import ir.ac.um.AndroidInstrumenter.Analysis.XMLFiles.LayoutInformationExtractor;
+import ir.ac.um.AndroidInstrumenter.Analysis.XMLFiles.StringValueExtractor;
+import ir.ac.um.AndroidInstrumenter.Taging.POSTagger;
+import ir.ac.um.AndroidInstrumenter.Utils.Utils;
+import ir.ac.um.AndroidInstrumenter.widget.Widget;
+import ir.ac.um.AndroidInstrumenter.widget.WidgetInfoExtrctor;
+
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
+public class ActvityInstrumneter {
+    private final boolean ExitPoint = true;
+    private final boolean EntryPoint = false;
+    private String classfilePath;
+    private CompilationUnit root;
+    private String valuesFileName;
+    private List<String> widgetList;
+    private List<Object> tmpWidgetsList;
+    private List<MethodDeclaration> methods;
+    private ProjectInformation projectInformation;
+    private String layoutFileName;
+
+    public ActvityInstrumneter(String classFilePath, ProjectInformation projectInformation) throws FileNotFoundException {
+        this.classfilePath = classFilePath;
+        this.valuesFileName = "strings";
+        methods = new ArrayList<>();
+        root = StaticJavaParser.parse(new File(classFilePath));
+        widgetList = new ArrayList<>();
+        tmpWidgetsList = new ArrayList<>();
+        this.projectInformation = projectInformation;
+        layoutFileName = "";
+    }
+
+    public void instrumentSourceCode() {
+        root.getTypes().forEach(node->{
+            System.out.println("Hello");
+            if(node.getName().toString().contains("Activity")){
+                methods.addAll(node.getMethods());
+                initializeLayoutFileName(methods);
+                try {
+                    generateActivitySchema(node);
+                } catch (IOException ioException) {
+                    ioException.printStackTrace();
+                }
+                instrumentActivity(node);
+            }
+        });
+    }
+
+    private void initializeLayoutFileName(List<MethodDeclaration> methods) {
+        MethodDeclaration onCreateMethod = getOnCreateMethod(methods);
+        MethodCallExpr setContentMethod = getSetContentMethodCallExpr(onCreateMethod);
+        layoutFileName = setContentMethod.getArgument(0).toString();
+        layoutFileName = layoutFileName.substring(layoutFileName.lastIndexOf('.')+1);
+    }
+
+    private MethodCallExpr getSetContentMethodCallExpr(MethodDeclaration onCreateMethod) {
+        MethodCallExpr setContentMethodCallExpr = null;
+        List<MethodCallExpr> methodCallExprs = getMethodCallExprFor(onCreateMethod);
+        for(MethodCallExpr callExpr : methodCallExprs)
+            if(callExpr.getNameAsString().contentEquals("setContentView"))
+                setContentMethodCallExpr = callExpr;
+
+        return setContentMethodCallExpr;
+    }
+
+    private List<MethodCallExpr> getMethodCallExprFor(MethodDeclaration method){
+        List<MethodCallExpr> methodCallExprs = new ArrayList<>();
+        method.findAll(MethodCallExpr.class).forEach(item->{
+            if(item.getNameAsString().contentEquals("setContentView"))
+                methodCallExprs.add(item);
+        });
+        return methodCallExprs;
+    }
+
+    private MethodDeclaration getOnCreateMethod(List<MethodDeclaration> methods) {
+        MethodDeclaration target = null;
+        for(MethodDeclaration method : methods)
+            if(method.getNameAsString().contentEquals("onCreate")){
+                target = method;
+                break;
+            }
+        return target;
+    }
+
+
+    private void generateActivitySchema(TypeDeclaration node) throws IOException {
+
+        List<VariableDeclarator> GUIWidgetVariables = getGUIVariables(node);
+        List<MethodDeclaration> innerMethods = new ArrayList<>();
+        String filePath = classfilePath.substring(0,classfilePath.lastIndexOf('/'));
+        String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+        File file = new File(filePath,"Schema.txt");
+        try{
+            if(!file.exists()){
+               createAndPrepareSchemaFile(file);
+            }
+            FileWriter fileWriter = new FileWriter(file,true);
+            fileWriter.append("ppt " + packageName + "." + node.getNameAsString() + "."
+                   + node.getNameAsString() +"():::ENTER\n" );
+            fileWriter.append("ppt-type enter\n\n");
+
+            fileWriter.append("ppt " + packageName + "." + node.getNameAsString() + "." +
+                   node.getNameAsString() +  "():::EXIT" + node.getRange().get().begin.line + "\n");
+            fileWriter.append("ppt-type subexit\n");
+            fileWriter.append(getObjectSchemaDescription(node, GUIWidgetVariables, packageName));
+
+            for(MethodDeclaration method : methods){
+                method.findAll(MethodDeclaration.class).forEach(item->{
+                   innerMethods.add(item);
+                });
+                for(MethodDeclaration innerMethod : innerMethods) {
+                    if(!isDialogMethod(innerMethod)){
+                        fileWriter.append(getMethodEntryPointSchemaDescription(node,packageName,innerMethod, GUIWidgetVariables));
+                        fileWriter.append(getMethodExitPointSchemaDescription(node,packageName,innerMethod, GUIWidgetVariables));
+                    }
+                }
+                innerMethods.clear();
+                fileWriter.flush();
+            }
+
+            fileWriter.append("\nppt " + packageName + "." + node.getNameAsString() + ":::OBJECT\n");
+            fileWriter.append("ppt-type object\n");
+            String content = getObjectSchemaDescription(node,GUIWidgetVariables,packageName);
+            content = content.substring(content.indexOf("\n") +1, content.length());
+            content = content.replaceAll("\n  parent " + packageName + "." + node.getNameAsString() + ":::OBJECT 1", "");
+            fileWriter.append(content);
+
+            for(MethodDeclaration method : methods){
+                if(cotainDialog(method)){
+                    List<VariableDeclarator> tmpGUIWidgetsList = getTempraryGUIVariables(method);
+                    int index = method.getBody().get().getStatements().size();
+
+                    String label = extractLabelForInnerCLass(method);
+                    // Inner class constructor schema description-- Enter point
+                    fileWriter.append("\nppt " + packageName + "." + node.getNameAsString() +
+                                       "$" + label  + "Dialog." + label + "Dialog(" + packageName + "." + node.getNameAsString() + "):::ENTER\n");
+                    fileWriter.append("ppt-type enter\n");
+                    content = getObjectSchemaDescription(node,GUIWidgetVariables,packageName);
+                    content = content.substring(content.indexOf("\n") +1, content.length());
+                    content = content.replaceAll("\n  parent " + packageName + "." + node.getNameAsString() + ":::OBJECT 1", "");
+                    content = content.replaceAll("this", packageName + "." + node.getNameAsString() + ".this");
+                    fileWriter.append(content);
+
+                    //Inner class constructor schema description --Exit point
+                    fileWriter.append("\nppt " + packageName + "." + node.getNameAsString() +
+                            "$" + label  + "Dialog." + label + "Dialog(" + packageName + "." + node.getNameAsString() + "):::EXIT" +
+                            method.getBody().get().getStatement(index -1).getEnd().get().line + "\n");
+                    fileWriter.append("ppt-type subexit\n");
+                    content = getObjectSchemaDescription(node,tmpGUIWidgetsList,packageName);
+                    content = content.replaceAll(packageName + "." + node.getNameAsString(),
+                            packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog");
+                    fileWriter.append(content);
+                    content = getObjectSchemaDescription(node,GUIWidgetVariables,packageName);
+                    content = content.substring(content.indexOf("\n") +1, content.length());
+                    content = content.replaceAll("this",packageName + "." + node.getNameAsString() + ".this");
+                    content = content.replaceAll(packageName + "." + node.getNameAsString() + ":::",
+                            packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog:::");
+                    fileWriter.append(content);
+
+                    method.findAll(MethodDeclaration.class).forEach(item->{
+                        if(isDialogMethod(item))
+                            innerMethods.add(item);
+                    });
+                    index = 0;
+                    List<Integer> exitPoints = new ArrayList<>();
+                    for(MethodDeclaration dialogMethod : innerMethods) {
+                        fileWriter.append("\n" + getDialogMethodSignatureInEntryPointForSchemaDescription(node.getNameAsString(),
+                                                                                                   packageName,dialogMethod));
+                        fileWriter.append("ppt-type enter\n");
+                        content = getObjectSchemaDescription(node, tmpGUIWidgetsList, packageName);
+                        content = content.replaceAll(packageName + "." + node.getNameAsString(),
+                                packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog");
+                        fileWriter.append(content);
+                        content = getObjectSchemaDescription(node, GUIWidgetVariables, packageName);
+                        content = content.substring(content.indexOf("\n") +1, content.length());
+                        content = content.replaceAll("this", packageName + "." + node.getNameAsString() + ".this");
+                        content = content.replaceAll(packageName + "." + node.getNameAsString() + ":::",
+                                packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog:::");
+                        fileWriter.append(content);
+                        extractMethodExitPoints(dialogMethod.getBody().get(),exitPoints);
+                        if(dialogMethod.getType().toString().contentEquals("void")){
+                            index = dialogMethod.getBody().get().getStatements().size();
+                            // int exitPoint = 0;
+                            if(index > 0){
+                                exitPoints.add(dialogMethod.getBody().get().getStatement(index -1).getEnd().get().line);
+                            }
+                            else
+                                exitPoints.add(dialogMethod.getBegin().get().line + 1);
+                        }
+
+                        for(Integer exitpoint : exitPoints){
+                            fileWriter.append("\n" + getDialogMethodSignatureInExitPointForSchemaDescription(node.getNameAsString(),
+                                    packageName,dialogMethod,exitpoint));
+                            fileWriter.append("ppt-type subexit\n");
+                            content = getObjectSchemaDescription(node, tmpGUIWidgetsList, packageName);
+                            content = content.replaceAll(packageName + "." + node.getNameAsString(),
+                                    packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog");
+                            fileWriter.append(content);
+                            content = getObjectSchemaDescription(node, GUIWidgetVariables, packageName);
+                            content = content.substring(content.indexOf("\n") +1, content.length());
+                            content = content.replaceAll("this", packageName + "." + node.getNameAsString() + ".this");
+                            content = content.replaceAll(packageName + "." + node.getNameAsString() + ":::",
+                                    packageName + "." + node.getNameAsString() + "\\$" + label + "Dialog:::");
+                            fileWriter.append(content);
+                        }
+                        exitPoints.clear();
+
+                    }
+                    innerMethods.clear();
+                    fileWriter.append("\nppt " + packageName + "." + node.getNameAsString() +
+                            "$" + label + "Dialog:::OBJECT\n");
+                    fileWriter.append("ppt-type object\n");
+                    content = getObjectSchemaDescription(node,tmpGUIWidgetsList,packageName);
+                    content = content.substring(content.indexOf("\n") +1, content.length());
+                    content = content.replaceAll("\n  parent "+ packageName + "." + node.getNameAsString() + ":::OBJECT 1", "");
+                    content = content.replaceAll(packageName + "." + node.getNameAsString(),
+                                                 packageName + "." + node.getNameAsString() + "\\$" +
+                                                  label + "Dialog");
+                    fileWriter.append(content);
+
+                    content = getObjectSchemaDescription(node,GUIWidgetVariables,packageName);
+                    content = content.substring(content.indexOf("\n") +1, content.length());
+                    content = content.replaceAll("\n  parent " + packageName + "." + node.getNameAsString() + ":::OBJECT 1", "");
+                    content = content.replaceAll("this",packageName + "." + node.getNameAsString() + ".this");
+                    content = content.replace("var-kind variable","var-kind variable\n  enclosing-var this");
+
+                    fileWriter.append(content);
+                }
+            }
+
+
+            fileWriter.flush();
+            fileWriter.close();
+
+        } catch (IOException ioe){
+            ioe.printStackTrace();
+        }
+    }
+
+    private String extractLabelForInnerCLass(MethodDeclaration method) {
+        String dialogTitle = "" , dialogMessage = "";
+        StringValueExtractor stringValueExtractor = new StringValueExtractor(
+                projectInformation.getValuesDirectory().getCanonicalPath().toString() + "/" + this.valuesFileName + ".xml");
+        List<MethodCallExpr> callExprs = new ArrayList<>();
+        method.findAll(MethodCallExpr.class).forEach(node -> {
+            if (node.getNameAsString().contentEquals("setTitle") || node.getNameAsString().contentEquals("setMessage"))
+                callExprs.add(node);
+        });
+
+        for (MethodCallExpr expr : callExprs) {
+            if (expr.getNameAsString().contentEquals("setTitle")) {
+                String objectName = expr.getScope().get().toString();
+                String containingClassName = resolveClassName(method, objectName);
+                if (containingClassName.contains("Dialog")) {
+                    if (expr.getArgument(0).toString().startsWith("R.string."))
+                        dialogTitle = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                    else {
+                        dialogTitle = expr.getArgument(0).toString();
+                        dialogTitle = dialogTitle.substring(1,dialogTitle.length()-1);
+                    }
+
+                }
+            } else if (expr.getNameAsString().contentEquals("setMessage")) {
+                String objectName = expr.getScope().get().toString();
+                String containingClassName = resolveClassName(method, objectName);
+                if (containingClassName.contains("Dialog")) {
+                    if (expr.getArgument(0).toString().startsWith("R.string."))
+                        dialogMessage = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                    else{
+                        dialogMessage = expr.getArgument(0).toString();
+                        dialogMessage = dialogMessage.substring(1,dialogMessage.length()-1);
+
+                    }
+                }
+            }
+        }
+        POSTagger posTagger = new POSTagger();
+        String label = "";
+        if (dialogTitle != "")
+            label = posTagger.generateLabelforDialog("I want to " + dialogTitle.toLowerCase());
+        else if (dialogMessage != "")
+            label = posTagger.generateLabelforDialog(dialogTitle);
+        return label;
+    }
+
+    private List<VariableDeclarator> getTempraryGUIVariables(MethodDeclaration method) {
+        List<VariableDeclarator> localVariables = getLocalVariables(method);
+        List<VariableDeclarator> tmpGUIWidgetsList = new ArrayList<>();
+        for(VariableDeclarator variableDeclarator : localVariables)
+            if(Utils.isWidget(variableDeclarator.getTypeAsString()))
+                tmpGUIWidgetsList.add(variableDeclarator);
+        return tmpGUIWidgetsList;
+    }
+
+
+    private String getObjectSchemaDescription(TypeDeclaration node, List<VariableDeclarator> GUIWidgetVariables, String packageName){
+        String result = "";
+        result += "parent parent " + packageName + "." + node.getNameAsString() + ":::OBJECT 1\n";
+        result += "variable this\n";
+        result += "  var-kind variable\n";
+        result += "  dec-type " + packageName + "." + node.getNameAsString() + "\n";
+        result += "  rep-type hashcode\n";
+        result += "  flags is_param non_null\n";
+        result += "  comparability 22\n";
+        result += "  parent " + packageName + "." + node.getNameAsString() + ":::OBJECT 1\n";
+        for(VariableDeclarator variable : GUIWidgetVariables)
+            result += getGUIVariableSchemaDescription(node, packageName,variable);
+        return result;
+    }
+
+    private String getMethodEntryPointSchemaDescription(TypeDeclaration node, String packageName,
+                                                         MethodDeclaration method,
+                                                         List<VariableDeclarator> guiWidgetVariables) {
+        String result = "\n";
+        if(isLocalMethod(method)){
+            result += getLocalMethodSignatureInEntryPointForSchemaDescrription(node.getNameAsString(),packageName,method);
+            result += "ppt-type enter\n";
+            result += getObjectSchemaDescription(node,guiWidgetVariables,packageName);
+
+
+        }
+        else if(isDialogMethod(method)){
+            result += getDialogMethodSignatureInEntryPointForSchemaDescription(node.getNameAsString(),packageName,method);
+            result += "ppt-type enter\n";
+            result += getObjectSchemaDescription(node,guiWidgetVariables,packageName);
+
+        }
+        else{
+            result += getInnerMethodSignatureInEntryPointForSchemaDecsrription(node.getNameAsString(),packageName,method);
+            result += "ppt-type enter\n";
+            result += getObjectSchemaDescription(node,guiWidgetVariables,packageName);
+
+        }
+        return result;
+    }
+
+    private String getMethodExitPointSchemaDescription(TypeDeclaration node, String packageName,
+                                                       MethodDeclaration method,
+                                                       List<VariableDeclarator> guiWidgetVariables) {
+        String result = "\n";
+        List<Integer> exitPoints = new ArrayList<>();
+
+        extractMethodExitPoints(method.getBody().get(),exitPoints);
+        if(method.getType().toString().contentEquals("void")){
+            int index = method.getBody().get().getStatements().size();
+            if(index > 0){
+                 exitPoints.add(method.getBody().get().getStatement(index -1).getEnd().get().line);
+            }
+            else
+                exitPoints.add(method.getBegin().get().line + 1);
+        }
+
+        for(Integer exitPoint :exitPoints){
+            if(isLocalMethod(method))
+                result += getLocalMethodSignatureInExitPointForSchemaDescrription(node.getNameAsString(),
+                                                                                  packageName,method,exitPoint);
+            else if(isDialogMethod(method))
+                result += getDialogMethodSignatureInExitPointForSchemaDescription(node.getNameAsString(),
+                                                                                  packageName,method,exitPoint);
+            else
+                result += getInnerMethodSignatureInExitPointForSchemaDecsrription(node.getNameAsString(),
+                                                                                  packageName,method,exitPoint);
+            result += "ppt-type subexit\n";
+            result += getObjectSchemaDescription(node,guiWidgetVariables,packageName);
+//            if(!method.getType().toString().contains("void"))
+//                result += getReturnSchemaDescription(packageName,method);
+        }
+        return result;
+    }
+
+    private String getReturnSchemaDescription(String packageName,MethodDeclaration method) {
+        String result = "";
+        String returnType = method.getType().toString();
+        if(returnType == "int"){
+            result += "variable return\n";
+            result += "  var-kind variable\n";
+            result += "  dec-type int\n";
+            result += "  rep-type int\n";
+            result += "  comparability 22\n";
+       } else if(returnType == "float"){
+            result += "variable return\n";
+            result += "  var-kind variable\n";
+            result += "  dec-type float\n";
+            result += "  rep-type float\n";
+            result += "  comparability 22\n";
+       } else if(returnType == "boolean"){
+            result += "variable return\n";
+            result += "  var-kind variable\n";
+            result += "  dec-type boolean\n";
+            result += "  rep-type boolean\n";
+            result += "  comparability 22\n";
+       } else if(returnType =="String"){
+            result += "variable return\n";
+            result += "  var-kind variable\n";
+            result += "  dec-type java.lang.String\n";
+            result += "  rep-type hashcode\n";
+            result += "  comparability 22\n";
+            result += "variable return.toString\n";
+            result += "  var-kind function toString()\n";
+            result += "  enclosing-var return\n";
+            result += "  dec-type java.lang.String\n";
+            result += "  function-args return\n";
+            result += "  flags synthetic to_string\n";
+            result += "  comparability 22\n";
+       } else if (returnType.contains("List")){
+            result += "variable return\n" +
+                      "  var-kind return\n" +
+                      "  dec-type java.util.List\n" +
+                      "  rep-type hashcode\n" +
+                      "  comparability 22\n" +
+                      "variable return[..]\n" +
+                      "  var-kind array\n" +
+                      "  enclosing-var return\n" +
+                      "  array 1\n" +
+                      "  dec-type java.util.List\n" +
+                      "  rep-type hashcode[]\n" +
+                      "  comparability 22\n" +
+                      "variable return[..].getClass().getName()\n" +
+                      "  var-kind function getClass().getName()\n" +
+                      "  enclosing-var return[..]\n" +
+                      "  array 1\n" +
+                      "  dec-type java.lang.Class[]\n" +
+                      "  rep-type java.lang.String[]\n" +
+                      "  function-args return[]\n" +
+                      "  flags synthetic classname non_null\n" +
+                      "  comparability 22\n" +
+                      "variable return.getClass().getName()\n" +
+                      "  var-kind function getClass().getName()\n" +
+                      "  enclosing-var return\n" +
+                      "  dec-type java.lang.Class\n" +
+                      "  rep-type java.lang.String\n" +
+                      "  function-args return\n" +
+                      "  flags synthetic classname non_null\n" +
+                      "  comparability 22\n";
+       }
+        return result;
+    }
+
+    private void extractMethodExitPoints(BlockStmt blockStatement,List<Integer> list) {
+        BlockStmt blockStmt;
+        for (int index = 0; index < blockStatement.getStatements().size(); index++) {
+            if (blockStatement.getStatement(index).isIfStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                IfStmt ifStmt = blockStatement.getStatements().get(index).asIfStmt();
+                BlockStmt thenBlockStmts;
+                if (ifStmt.getThenStmt().isBlockStmt())
+                    thenBlockStmts = ifStmt.getThenStmt().asBlockStmt();
+                else
+                    thenBlockStmts = convertStatmentToBlockStatement(ifStmt.getThenStmt());
+                if (thenBlockStmts.toString().contains("return")) {
+                    extractMethodExitPoints(thenBlockStmts, list);
+                    ifStmt.setThenStmt((Statement) thenBlockStmts);
+                }
+                if (ifStmt.hasElseBlock()) {
+                    BlockStmt elseBlockStmts;
+                    if (ifStmt.getElseStmt().get().toString().contains("return")) {
+                        if (ifStmt.getElseStmt().get().isBlockStmt())
+                            elseBlockStmts = ifStmt.getElseStmt().get().asBlockStmt();
+                        else
+                            elseBlockStmts = convertStatmentToBlockStatement(ifStmt.getElseStmt().get());
+                        extractMethodExitPoints(elseBlockStmts, list);
+                        ifStmt.setElseStmt((Statement) elseBlockStmts);
+                    }
+                }
+                blockStatement.getStatements().replace(blockStatement.getStatement(index), (Statement) ifStmt);
+            } else if (blockStatement.getStatements().get(index).isForStmt() &&
+                    blockStatement.getStatements().get(index).toString().contains("return")) {
+                ForStmt forStmt = blockStatement.getStatement(index).asForStmt();
+                if (forStmt.getBody().isBlockStmt())
+                    blockStmt = forStmt.getBody().asBlockStmt();
+                else
+                    blockStmt = convertStatmentToBlockStatement(forStmt.getBody());
+                extractMethodExitPoints(blockStmt, list);
+                forStmt.setBody(blockStmt);
+                blockStatement.getStatements().replace(blockStatement.getStatement(index), forStmt);
+            } else if (blockStatement.getStatement(index).isForEachStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                ForEachStmt forEachStmt = blockStatement.getStatement(index).asForEachStmt();
+                if (forEachStmt.getBody().isBlockStmt())
+                    blockStmt = forEachStmt.getBody().asBlockStmt();
+                else
+                    blockStmt = convertStatmentToBlockStatement(forEachStmt.getBody());
+                extractMethodExitPoints(blockStmt, list);
+                // forEachStmt.setBody(blockStmt);
+                // blockStatement.getStatements().replace(blockStatement.getStatement(index),forEachStmt);
+            } else if (blockStatement.getStatement(index).isSwitchStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                SwitchStmt switchStmt = blockStatement.getStatement(index).asSwitchStmt();
+                NodeList<SwitchEntry> switchEntries = switchStmt.getEntries();
+                for (SwitchEntry switchEntry : switchEntries) {
+                    if (switchEntry.toString().contains("return")) {
+                        blockStmt = new BlockStmt();
+                        blockStmt.setStatements(switchEntry.getStatements());
+                        extractMethodExitPoints(blockStmt, list);
+                        // switchEntry.setStatements(blockStmt.getStatements());
+                    }
+                }
+                // switchStmt.setEntries(switchEntries);
+
+            } else if (blockStatement.getStatement(index).isDoStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                DoStmt doStmt = blockStatement.getStatement(index).asDoStmt();
+                if (doStmt.getBody().isBlockStmt())
+                    blockStmt = doStmt.getBody().asBlockStmt();
+                else
+                    blockStmt = convertStatmentToBlockStatement(doStmt.getBody());
+                extractMethodExitPoints(blockStmt, list);
+            } else if (blockStatement.getStatement(index).isWhileStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                WhileStmt whileStmt = blockStatement.getStatement(index).asWhileStmt();
+                if (whileStmt.getBody().isBlockStmt())
+                    blockStmt = whileStmt.getBody().asBlockStmt();
+                else
+                    blockStmt = convertStatmentToBlockStatement(whileStmt.getBody());
+                extractMethodExitPoints(blockStmt, list);
+                //whileStmt.setBody(blockStmt);
+                //blockStatement.getStatements().replace(blockStatement.getStatement(index),whileStmt);
+
+            } else if (blockStatement.getStatement(index).isTryStmt() &&
+                    blockStatement.getStatement(index).toString().contains("return")) {
+                TryStmt tryStmt = blockStatement.getStatement(index).asTryStmt();
+                blockStmt = tryStmt.getTryBlock();
+                //blockStmt = convertStatmentToBlockStatement(tryStmt.);
+                extractMethodExitPoints(blockStmt, list);
+                //tryStmt.setTryBlock(blockStmt);
+                //blockStatement.getStatements().replace(blockStatement.getStatement(index),tryStmt);
+
+            } else if (blockStatement.getStatement(index).isReturnStmt()) {
+               list.add(blockStatement.getStatement(index).getEnd().get().line);
+            }
+        }
+    }
+
+    private String getInnerMethodSignatureInExitPointForSchemaDecsrription(String className, String packageName,
+                                                                           MethodDeclaration method, Integer exitPoint) {
+        return "ppt " + packageName + "." + className + "." +  getInnerMethodSignature(method) +
+                "():::EXIT" + exitPoint + "\n";
+    }
+
+    private String getLocalMethodSignatureInExitPointForSchemaDescrription(String className, String packageName,
+                                                                           MethodDeclaration method, Integer exitPoint) {
+        return "ppt " + packageName + "." + className + "." + method.getNameAsString() +"():::EXIT" + exitPoint + "\n";
+
+    }
+
+    private String getDialogMethodSignatureInExitPointForSchemaDescription(String className, String packageName,
+                                                                           MethodDeclaration method, Integer exitPoint) {
+        String result = "";
+        if(isPositiveButtonOnClick(method))
+            result = "ppt " + packageName + "." + className + "$" + getDialogMethodSignature(method) +
+                    "Dialog.ConfirmButton_onClick():::EXIT" + exitPoint + "\n";
+        else
+            result = "ppt " + packageName + "." + className + "$" + getDialogMethodSignature(method) +
+                    "Dialog.CancelButton_onClick():::EXIT" + exitPoint + "\n";
+        return result;
+    }
+
+    private String getInnerMethodSignatureInEntryPointForSchemaDecsrription(String className, String packageName,
+                                                                MethodDeclaration method) {
+        return "ppt " + packageName + "." + className + "." + getInnerMethodSignature(method) +
+                "():::ENTER\n";
+    }
+
+    private String getDialogMethodSignatureInEntryPointForSchemaDescription(String className, String packageName,
+                                                                MethodDeclaration method) {
+        String result = "";
+        if(isPositiveButtonOnClick(method))
+           result = "ppt " + packageName + "." + className + "$" + getDialogMethodSignature(method) +
+                "Dialog.ConfirmButton_onClick():::ENTER\n";
+        else
+            result = "ppt " + packageName + "." + className + "$" + getDialogMethodSignature(method) +
+                    "Dialog.CancelButton_onClick():::ENTER\n";
+        return result;
+    }
+
+    private String getLocalMethodSignatureInEntryPointForSchemaDescrription(String className, String packageName,
+                                                                MethodDeclaration method) {
+        return "ppt " + packageName + "." + className + "." + method.getNameAsString() +"():::ENTER\n";
+    }
+
+    private boolean isPositiveButtonOnClick(MethodDeclaration method){
+        boolean result = false;
+        Node tmpNode = (Node) method;
+        while (!tmpNode.getParentNode().get().getClass().toString().contains("MethodCallExpr"))
+            tmpNode = tmpNode.getParentNode().get();
+        tmpNode = tmpNode.getParentNode().get();
+        MethodCallExpr expr = (MethodCallExpr) tmpNode;
+        if(expr.getName().toString().contains("setPositiveButton"))
+            result = true;
+        return result;
+    }
+
+    private String getGUIVariableSchemaDescription(TypeDeclaration node,String packageName,VariableDeclarator variable) {
+        WidgetInfoExtrctor widgetInfoExtrctor = new WidgetInfoExtrctor();
+        String result = widgetInfoExtrctor.captureWidgetInfo(node.getNameAsString(),packageName,
+                variable.getNameAsString(),variable.getType().toString());
+        return result;
+    }
+
+    private List<VariableDeclarator> getGUIVariables(TypeDeclaration node) {
+        List<VariableDeclarator> GUIWidgetList = new ArrayList<>();
+//        for (Object field : node.getFields())
+//            for (VariableDeclarator variable : ((FieldDeclaration) field).getVariables())
+//                if (Utils.isWidget(variable.getType().toString()))
+//                    GUIWidgetList.add(variable);
+
+        String layoutFilePath = projectInformation.getLayoutsDirectory().getCanonicalPath().toString() + "/" + this.layoutFileName + ".xml";
+        String valueFilePath = projectInformation.getValuesDirectory().getCanonicalPath().toString() + "/" + "strings.xml";
+        LayoutInformationExtractor layoutInformationExtractor =
+                new LayoutInformationExtractor(layoutFilePath, valueFilePath);
+        layoutInformationExtractor.getGUIWidgetlist();
+        return GUIWidgetList;
+    }
+
+    private List<Widget> getGUIWidgets(TypeDeclaration node) {
+        List<Widget> GUIWidgetList = new ArrayList<>();
+        String layoutFilePath = projectInformation.getLayoutsDirectory().getCanonicalPath() + "/" + layoutFileName + ".xml";
+        String valueFilePath = projectInformation.getValuesDirectory().getCanonicalPath() + "/" + "strings.xml";
+        LayoutInformationExtractor layoutInformationExtractor =
+                new LayoutInformationExtractor(layoutFilePath, valueFilePath);
+
+          return GUIWidgetList;
+   }
+    private void createAndPrepareSchemaFile(File file) {
+        LocalDateTime localDateTime;
+        localDateTime = LocalDateTime.now();
+        String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+        try {
+            file.createNewFile();
+            FileWriter fwriter = new FileWriter(file,true);
+            fwriter.append("// Declarations for " + packageName  + "\n");
+            fwriter.append("// Declarations written by Chicory " + localDateTime + "\n\n");
+            fwriter.append("decl-version 2.0\n");
+            fwriter.append("var-comparability none\n\n");
+            fwriter.flush();
+            fwriter.close();
+        } catch (IOException ioException) {
+            ioException.printStackTrace();
+        }
+    }
+
+    public String getPackageName(){
+        return root.getPackageDeclaration().get().getName().toString();
+    }
+
+    private void instrumentActivity(TypeDeclaration activityClass){
+        String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+        int exitPoint = activityClass.getRange().get().begin.line;
+        instrumentFieldsInActivityClass(activityClass);
+        ConstructorDeclaration constructor =
+                createInstrumentedConstructorMethodForActivityClass(activityClass);
+
+        MethodDeclaration initialWidgetListMethod = createInitailWidgetListMethodForActivityClass(activityClass);
+        MethodDeclaration emptyWidgetListMethod = createEmptyWidgetListMethodForActivityClass(activityClass);
+        appendCallingOfInstrumentedMethodInConstructor(constructor,packageName,activityClass.getNameAsString(),
+                                                       initialWidgetListMethod.getNameAsString(),
+                                                       emptyWidgetListMethod.getNameAsString(),exitPoint);
+        instrumentActivityMethods(activityClass,methods);
+    }
+
+    private void instrumentActivityMethods(TypeDeclaration activity, List<MethodDeclaration> methods) {
+        List<MethodDeclaration> innerMethods = new ArrayList<>();
+        for (MethodDeclaration method : methods) {
+            method.findAll(MethodDeclaration.class).forEach(node -> {
+                innerMethods.add(node);
+            });
+            for (MethodDeclaration innerMethod : innerMethods) {
+                instrumentExitPoint(activity, innerMethod);
+                instrumentEntryPoint(activity, innerMethod);
+            }
+            innerMethods.clear();
+        }
+    }
+
+    private void instrumentEntryPoint(TypeDeclaration activity, MethodDeclaration method) {
+        String block = "";
+        String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+        if(cotainDialog(method))
+            instrumenStatementsForGatheringTemporaryWidgetList(method);
+        if(isLocalMethod(method))
+           block = "{\n" +
+                    " initialWidgetList();" +
+                    "instrumenter.getLocalMethodEntryPoint(this,\"" + packageName + "\",\"" + activity.getNameAsString() + "\",\"" +
+                    method.getNameAsString() +"\",widgetList,widgetsNameList,widgetTypeList);" +
+                    "emptyWidgetList();" +
+                  "}\n";
+        else
+            if(isDialogMethod(method))
+               block = "{\n" +
+                        " initialWidgetList();" +
+                        "instrumenter.getDialogMethodEntryPoint(" + activity.getNameAsString() + ".this,\"" + packageName +
+                       "\",\"" + activity.getNameAsString() + "\",dialog,\"" + getDialogMethodSignature(method) +
+                        "\",widgetList,widgetsNameList,widgetTypeList,tmpWidgetList,tmpWidgetsNameList,tmpWidgetTypeList" +
+                        ",whichButton);" +
+                        "emptyWidgetList();" +
+                      "}\n";
+            else
+                block = "{\n" +
+                        " initialWidgetList();" +
+                        "instrumenter.getLocalMethodEntryPoint(" + activity.getNameAsString() + ".this,\"" +
+                        packageName + "\",\"" + activity.getNameAsString() +"\",\"" + getInnerMethodSignature(method) + "\"," +
+                        "widgetList,widgetsNameList,widgetTypeList);" +
+                        "emptyWidgetList();" +
+                        "}\n";
+
+        BlockStmt blockStmt = StaticJavaParser.parseBlock(block);
+        int index = 0;
+        for(Statement statement : blockStmt.getStatements())
+            method.getBody().get().addStatement(index++,statement);
+    }
+
+    private String getDialogMethodSignature(MethodDeclaration method) {
+        return extractLabelForDialogMethod(method);
+    }
+
+    private String getEndSectionOfInstrumentedCodesAsStringInDialogMethod(String activityName, MethodDeclaration method,
+                                                                          String returnBlock) {
+        String  dialogObject = getDialogObject(method);
+        String block = "\t\tif(" + dialogObject + " != null){\n" +
+                "\t\t\tfwriter.append(\"this\\n\");\n" +
+                "\t\t\tfwriter.append("+ dialogObject + ".hashCode() +\"\\n\");\n" +
+                "\t\t}\n";
+        block += "\t\tint index = 0;\n" +
+                "\t\tfor(View innerViewItem : tmpWidgetList){\n"+
+                "\t\t\t String content = widgetInfoExtractor.captureWidgetInfo(innerViewItem,tmpWidgetsNameList.get(index)," +
+                "tmpWidgetTypeList.get(index));\n" +
+                "\t\t\t content = content.replaceAll(\"Ania.\"," + "\"\");" +
+                "\t\t\tfwriter.append(content);\n" +
+                "\t\t\t index++;" +
+                "\t\t}\n";
+
+        block += returnBlock;
+
+        block += "\t\tfwriter.append(\"" + activityName + ".this\\n\");\n" +
+                "\t\tfwriter.append(" + activityName + ".this.hashCode() +\"\\n\");\n";
+        block += "\t\t index = 0;\n";
+        block += "\t\tfor(View viewItem : widgetList){\n" +
+                "\t\t\t String content = widgetInfoExtractor.captureWidgetInfo(viewItem,widgetsNameList.get(index),widgetTypeList.get(index));\n" +
+                "\t\t\t content = content.replaceAll(\"Ania\"," + "\"" + activityName + "\");" +
+                "\t\t\tfwriter.append(content);\n" +
+                "\t\t\t index++;" +
+                "\t\t}\n";
+        block += "\t\tfwriter.flush();\n" +
+                "\t\tfwriter.close();\n" +
+                "\t} catch(IOException ioe){\n" +
+                "\t\t\tioe.printStackTrace();" +
+                "\n\t}\n" +
+                "}";
+        return block;
+    }
+
+    private String getReturnInstrumentedCodes(ReturnStmt returnStmt, String returnType) {
+        String block = "";
+        switch(returnType){
+            case "void" : break;
+            case "boolean":
+            case "int":
+            case "float":
+                            block += "return\\n";
+                            block += returnStmt.getExpression().get().toString() + "\\n";
+                            block += "1\\n";
+                            break;
+            case "String":  block += "return\n";
+                            block += returnStmt.getExpression().get().hashCode() +"\n";
+                            block += returnStmt.getExpression().get().toString() + "\n";
+                            block += "1\n";
+
+        }
+        return block;
+    }
+
+    private boolean cotainDialog(MethodDeclaration method) {
+        boolean flag = false;
+        List<VariableDeclarator> localVariables = getLocalVariables(method);
+        for(VariableDeclarator variable : localVariables)
+            if(variable.getType().toString().contains("Dialog"))
+                flag = true;
+        return flag;
+    }
+
+    private boolean isDialogMethod(MethodDeclaration method) {
+        boolean result = false;
+        if(method.getParameters().size() > 0)
+           if(method.getParameter(0).getType().toString().contentEquals("DialogInterface"))
+              result = true;
+        return result;
+    }
+
+    private boolean isLocalMethod(MethodDeclaration method ) {
+
+        if(method.getParentNode().get().getClass().toString().contains("ClassOrInterfaceDeclaration"))
+            return true;
+        else
+            return false;
+    }
+
+    private void instrumenStatementsForGatheringTemporaryWidgetList(MethodDeclaration method){
+        List<VariableDeclarator> variableDeclaratorList = getLocalVariables(method);
+        boolean flag = false;
+        BlockStmt blockStmt = StaticJavaParser.parseBlock("{" +
+                "List<View> tmpWidgetList = new ArrayList<>();" +
+                "List<String> tmpWidgetTypeList = new ArrayList<>();" +
+                "List<String> tmpWidgetsNameList = new ArrayList<>();" +
+                "}");
+        int index = 0;
+        for(Statement statement : blockStmt.getStatements())
+            method.getBody().get().addStatement(index++,statement);
+
+
+        index = 0;
+        for(Statement statement : method.getBody().get().getStatements())
+            if(statement.toString().contains(".setView(")){
+                flag = true;
+                break;
+            }
+            else
+                index++;
+
+        if(flag){
+            for(VariableDeclarator variableDeclarator : variableDeclaratorList)
+                if(Utils.isWidget(variableDeclarator.getType().toString())){
+                    method.getBody().get().addStatement(index++,
+                            StaticJavaParser.parseStatement("tmpWidgetList.add((View)" + variableDeclarator.getNameAsString()
+                                    +");"));
+                    method.getBody().get().addStatement(index++,
+                            StaticJavaParser.parseStatement("tmpWidgetTypeList.add(\"" + variableDeclarator.getTypeAsString()
+                                    +"\");"));
+                    method.getBody().get().addStatement(index++,
+                            StaticJavaParser.parseStatement("tmpWidgetsNameList.add(\"" + variableDeclarator.getNameAsString()
+                                    + "\");"));
+                }
+        }
+    }
+
+    private String getStartSectionOfInstrumentedCodesAsString(){
+        String block;
+        block = "{\n\t" +
+                        "WidgetInfoExtrctor widgetInfoExtractor = new WidgetInfoExtrctor();\n\t" +
+                        "initialWidgetList();\n\t" +
+                        "File filePath = new File(Environment.getExternalStorageDirectory(),\"MyData\");\n\t" +
+                        "if(!filePath.exists())\n\t\t" +
+                        "filePath.mkdirs();\n\t" +
+                        "File traceFile = new File(filePath,\"_traceData.txt\");\n\t" +
+                        "FileWriter fwriter = null;\n\t" +
+                        "try{\n" +
+                       "\t\tfwriter = new FileWriter(traceFile,true);\n";
+        return block;
+    }
+
+    private String getEndSectionOfInstrumentedCodesAsString(String activityName,MethodDeclaration method,
+                                                            String returnBlock){
+        String block;
+        block = "\t\tif(this != null){\n" +
+                "\t\t\tfwriter.append(\"this\\n\");\n" +
+                "\t\t\tfwriter.append(this.hashCode() +\"\\n\");\n" +
+                "\t\t}\n";
+        block += "\t\t int index = 0;\n" +
+                "\t\tfor(View viewItem : widgetList){\n" +
+                "\t\t\t String content = widgetInfoExtractor.captureWidgetInfo(viewItem,widgetsNameList.get(index),widgetTypeList.get(index));\n" +
+                "\t\t\t content = content.replaceAll(\"Ania.\"," + "\"\");\n" +
+                "\t\t\tfwriter.append(content);\n" +
+                "\t\t\t index++;\n" +
+                "\t\t}\n";
+
+        block += returnBlock;
+
+
+        block += "\t\tfwriter.flush();\n" +
+                "\t\tfwriter.close();\n" +
+                "\t} catch(IOException ioe){\n" +
+                "\t\t\tioe.printStackTrace();\n" +
+                "\n\t}\n" +
+                "\temptyWidgetList();\n" +
+                "}";
+        return block;
+    }
+
+    private String getLocalMethodSignatureInEntryPoint(String activityName,MethodDeclaration method){
+        String block = "\t\tfwriter.append(\"\\nppt " + activityName + "." +
+                method.getNameAsString() + "():::Enter\\n\");\n";
+        return block;
+    }
+
+    private String getInnerMethodSignature(MethodDeclaration method){
+        String block = "";
+        //block = "fwriter.append(\"ppt " + activityName.toString() + ".";
+        Node tmpNode = (Node) method;
+        while (!tmpNode.getParentNode().get().getClass().toString().contains("MethodCallExpr"))
+            tmpNode = tmpNode.getParentNode().get();
+        tmpNode = tmpNode.getParentNode().get();
+        MethodCallExpr expr = (MethodCallExpr) tmpNode;
+        String methodName = expr.getScope().get().toString();
+        block += methodName;
+        block += "_" + expr.getNameAsString().substring(expr.getNameAsString().indexOf('O'), expr.getNameAsString().lastIndexOf('L'));
+        //block += "():::Enter\\n\");\n";
+        return block;
+    }
+
+    private String getDialogMethodSignatureInEntryPoint(String activityName,MethodDeclaration method){
+        String label = extractLabelForDialogMethod(method);
+        String block;
+        block = "\t\tint flag = " + method.getParameter(1).getNameAsString() + ";\n";
+        block += "\t\tif(flag == -1)\n";
+        block += "\t\t\tfwriter.append(\"\\nppt " + activityName + "$" + label +
+                "Dialog.ConfirmButton_onClick():::Enter\\n\");\n";
+        block += "\t\t else if(flag == -2) \n";
+        block += "\t\t\t fwriter.append(\"\\nppt " + activityName + "$" + label +
+                "Dialog.CancelButton_onClick():::Enter\\n\");\n";
+        return block;
+    }
+
+    private String getDialogObject(MethodDeclaration method) {
+        List<VariableDeclarator> localVarriableList;
+        Node tmpNode = (Node) method.getParentNode().get();
+        while (!tmpNode.getClass().toString().contains("MethodDeclaration"))
+            tmpNode = tmpNode.getParentNode().get();
+        localVarriableList = getLocalVariables((MethodDeclaration) tmpNode);
+        for(VariableDeclarator varriable : localVarriableList)
+            if(varriable.getType().toString().contains("Dialog"))
+                return varriable.getNameAsString();
+        return "";
+    }
+
+    private String extractLabelForDialogMethod(MethodDeclaration method) {
+        String dialogTitle = "", dialogMessage = "";
+        StringValueExtractor stringValueExtractor = new StringValueExtractor(
+                projectInformation.getValuesDirectory().getCanonicalPath().toString() + "/" + this.valuesFileName + ".xml");
+        Node tmpNode = (Node) method.getParentNode().get();
+        while (!tmpNode.getClass().toString().contains("MethodDeclaration"))
+            tmpNode = tmpNode.getParentNode().get();
+        final MethodDeclaration methodDeclaration = (MethodDeclaration) tmpNode;
+        List<MethodCallExpr> callExprs = new ArrayList<>();
+        tmpNode.findAll(MethodCallExpr.class).forEach(node -> {
+            if (node.getNameAsString().contentEquals("setTitle") || node.getNameAsString().contentEquals("setMessage"))
+                callExprs.add(node);
+        });
+
+        for (MethodCallExpr expr : callExprs) {
+            if (expr.getNameAsString().contentEquals("setTitle")) {
+                String objectName = expr.getScope().get().toString();
+                String containingClassName = resolveClassName(methodDeclaration, objectName);
+                if (containingClassName.contains("Dialog")) {
+                    if (expr.getArgument(0).toString().startsWith("R.string."))
+                        dialogTitle = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                    else {
+                        dialogTitle = expr.getArgument(0).toString();
+                        dialogTitle = dialogTitle.substring(1,dialogTitle.length()-1);
+                    }
+
+                }
+            } else if (expr.getNameAsString().contentEquals("setMessage")) {
+                String objectName = expr.getScope().get().toString();
+                String containingClassName = resolveClassName(methodDeclaration, objectName);
+                if (containingClassName.contains("Dialog")) {
+                    if (expr.getArgument(0).toString().startsWith("R.string."))
+                        dialogMessage = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                    else{
+                        dialogMessage = expr.getArgument(0).toString();
+                        dialogMessage = dialogMessage.substring(1,dialogMessage.length()-1);
+
+                    }
+                }
+            }
+        }
+        POSTagger posTagger = new POSTagger();
+        String label = "";
+        if (dialogTitle != "")
+            label = posTagger.generateLabelforDialog("I want to " + dialogTitle.toLowerCase());
+        else if (dialogMessage != "")
+            label = posTagger.generateLabelforDialog(dialogTitle);
+        return label;
+    }
+
+    private void instrumentExitPoint(TypeDeclaration activity, MethodDeclaration method) {
+       method.setBody(locateAndInstrumentExitPoint(activity,method,method.getBody().get()));
+       String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+        if(method.getType().toString().contentEquals("void")){
+            int index = method.getBody().get().getStatements().size();
+            int exitPoint = 0;
+            if(index > 0){
+                exitPoint = method.getBody().get().getStatement(index -1).getEnd().get().line;
+            }
+            else
+                exitPoint = method.getBegin().get().line + 1;
+
+
+            String block =""; //getStartSectionOfInstrumentedCodesAsString();
+
+            if(isLocalMethod(method)){
+                block += "{\n";
+                block += "initialWidgetList();\n";
+                if(cotainDialog(method)){
+                    for(Statement stmt : method.getBody().get().getStatements()) {
+                        stmt.findAll(MethodCallExpr.class).forEach(item->{
+                            if(item.toString().contains("show()")){
+                                String objectName = item.getScope().get().toString();
+                                String containingClassName = resolveClassName(method, objectName);
+                                if(containingClassName.contains("Dialog"))
+                                    stmt.replace(StaticJavaParser.parseStatement("Dialog dialog = " + stmt.toString()));
+                            }
+                        });
+                    }
+                    block += "instrumenter.captureInnerClass(this,\"" + activity.getNameAsString() + "\"," +
+                            "\"" + packageName + "\",\"" + extractLabelForInnerCLass(method) + "\",dialog,widgetList,widgetsNameList," +
+                            "widgetTypeList,tmpWidgetList,tmpWidgetsNameList,tmpWidgetTypeList," + exitPoint + ");\n";
+                }
+                block += "instrumenter.getLocalMehodExitPoint(this,\"" + packageName + "\",\"" + activity.getNameAsString() + "\",\"" +
+                        method.getNameAsString() +"\",widgetList,widgetsNameList,widgetTypeList," + exitPoint + ",\"\");\n" +
+                        "emptyWidgetList();\n";
+                block += "}\n";
+                //block += getLocalMethodSignatureInExitPoint(activity.getNameAsString(),method,index);
+                //block += getEndSectionOfInstrumentedCodesAsString(activity.getNameAsString(),method,"");
+            }
+            else{
+                if(isDialogMethod(method)){
+                    block += "{\n" +
+                            "initialWidgetList();\n" +
+                            "instrumenter.getDialogMethodExitPoint(" + activity.getNameAsString() + ".this,\"" + packageName +"\",\"" +
+                            activity.getNameAsString() + "\",dialog,\"" + getDialogMethodSignature(method) +
+                            "\",widgetList,widgetsNameList,widgetTypeList,tmpWidgetList,tmpWidgetsNameList,tmpWidgetTypeList" +
+                            ",whichButton," + exitPoint + ",\"\");" +
+                            "emptyWidgetList();" +
+                            "}\n";
+                    //block += getDialogMethodSignatureInExitPoint(activity.getNameAsString(),method,index);
+                    //block += getEndSectionOfInstrumentedCodesAsStringInDialogMethod(activity.getNameAsString(),
+                    //        method,"");
+                }
+                else{
+                    block += "{\n" +
+                            "initialWidgetList();\n" +
+                            "instrumenter.getLocalMehodExitPoint(" + activity.getNameAsString() + ".this,\"" + packageName +
+                            "\",\"" + activity.getNameAsString() + "\",\"" + getInnerMethodSignature(method) + "\"," +
+                            "widgetList,widgetsNameList,widgetTypeList," + exitPoint + ",\"\");\n" +
+                            "emptyWidgetList();" +
+                            "}\n";
+                    //block += getInnerMethodSignatureInExitPoint(activity.getNameAsString(),method,index);
+                   // block += getEndSectionOfInstrumentedCodesAsString(activity.getNameAsString(),method,"");
+                }
+            }
+
+            BlockStmt blockStmt = StaticJavaParser.parseBlock(block);
+            for(Statement statement : blockStmt.getStatements())
+                method.getBody().get().addStatement(statement);
+        }
+    }
+
+        private BlockStmt locateAndInstrumentExitPoint(TypeDeclaration activity, MethodDeclaration method,
+                                                   BlockStmt blockStatement) {
+        BlockStmt blockStmt;
+        for(int index = 0; index < blockStatement.getStatements().size(); index++){
+             if(blockStatement.getStatement(index).isIfStmt() &&
+                blockStatement.getStatement(index).toString().contains("return")){
+                    IfStmt ifStmt = blockStatement.getStatements().get(index).asIfStmt();
+                    BlockStmt thenBlockStmts;
+                    if(ifStmt.getThenStmt().isBlockStmt())
+                        thenBlockStmts = ifStmt.getThenStmt().asBlockStmt();
+                    else
+                        thenBlockStmts = convertStatmentToBlockStatement(ifStmt.getThenStmt());
+                    if(thenBlockStmts.toString().contains("return")){
+                        thenBlockStmts =  locateAndInstrumentExitPoint(activity,method, thenBlockStmts);
+                        ifStmt.setThenStmt((Statement) thenBlockStmts);
+                    }
+                    if(ifStmt.hasElseBlock()) {
+                            BlockStmt elseBlockStmts;
+                            if (ifStmt.getElseStmt().get().toString().contains("return")) {
+                                if(ifStmt.getElseStmt().get().isBlockStmt())
+                                     elseBlockStmts = ifStmt.getElseStmt().get().asBlockStmt();
+                                else
+                                    elseBlockStmts = convertStatmentToBlockStatement(ifStmt.getElseStmt().get());
+                                elseBlockStmts = locateAndInstrumentExitPoint(activity, method, elseBlockStmts);
+                                ifStmt.setElseStmt((Statement) elseBlockStmts);
+                            }
+                    }
+                    blockStatement.getStatements().replace(blockStatement.getStatement(index),(Statement)  ifStmt);
+             } else if(blockStatement.getStatements().get(index).isForStmt() &&
+                       blockStatement.getStatements().get(index).toString().contains("return")){
+                    ForStmt forStmt = blockStatement.getStatement(index).asForStmt();
+                    if(forStmt.getBody().isBlockStmt())
+                        blockStmt = forStmt.getBody().asBlockStmt();
+                    else
+                        blockStmt = convertStatmentToBlockStatement(forStmt.getBody());
+                    blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                    forStmt.setBody(blockStmt);
+                    blockStatement.getStatements().replace(blockStatement.getStatement(index),forStmt);
+             } else if(blockStatement.getStatement(index).isForEachStmt() &&
+                       blockStatement.getStatement(index).toString().contains("return")){
+                 ForEachStmt forEachStmt = blockStatement.getStatement(index).asForEachStmt();
+                 if(forEachStmt.getBody().isBlockStmt())
+                     blockStmt = forEachStmt.getBody().asBlockStmt();
+                 else
+                     blockStmt = convertStatmentToBlockStatement(forEachStmt.getBody());
+                 blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                 forEachStmt.setBody(blockStmt);
+                 blockStatement.getStatements().replace(blockStatement.getStatement(index),forEachStmt);
+             } else if(blockStatement.getStatement(index).isSwitchStmt() &&
+                       blockStatement.getStatement(index).toString().contains("return")){
+                 SwitchStmt switchStmt = blockStatement.getStatement(index).asSwitchStmt();
+                 NodeList<SwitchEntry> switchEntries = switchStmt.getEntries();
+                 for(SwitchEntry switchEntry :switchEntries){
+                     if(switchEntry.toString().contains("return")){
+                         blockStmt = new BlockStmt();
+                         blockStmt.setStatements(switchEntry.getStatements());
+                         blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                         switchEntry.setStatements(blockStmt.getStatements());
+                     }
+                 }
+                 switchStmt.setEntries(switchEntries);
+
+             } else if(blockStatement.getStatement(index).isDoStmt() &&
+                       blockStatement.getStatement(index).toString().contains("return")){
+                 DoStmt doStmt = blockStatement.getStatement(index).asDoStmt();
+                 if(doStmt.getBody().isBlockStmt())
+                     blockStmt = doStmt.getBody().asBlockStmt();
+                 else
+                     blockStmt = convertStatmentToBlockStatement(doStmt.getBody());
+                 blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                 doStmt.setBody(blockStmt);
+                 blockStatement.getStatements().replace(blockStatement.getStatement(index),doStmt);
+
+             } else if(blockStatement.getStatement(index).isWhileStmt() &&
+                       blockStatement.getStatement(index).toString().contains("return")){
+                 WhileStmt whileStmt = blockStatement.getStatement(index).asWhileStmt();
+                 if(whileStmt.getBody().isBlockStmt())
+                     blockStmt = whileStmt.getBody().asBlockStmt();
+                 else
+                     blockStmt = convertStatmentToBlockStatement(whileStmt.getBody());
+                 blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                 whileStmt.setBody(blockStmt);
+                 blockStatement.getStatements().replace(blockStatement.getStatement(index),whileStmt);
+
+             }else if(blockStatement.getStatement(index).isTryStmt() &&
+                      blockStatement.getStatement(index).toString().contains("return")){
+                 TryStmt tryStmt = blockStatement.getStatement(index).asTryStmt();
+                 blockStmt = tryStmt.getTryBlock();
+                 //blockStmt = convertStatmentToBlockStatement(tryStmt.);
+                 blockStmt = locateAndInstrumentExitPoint(activity,method,blockStmt);
+                 tryStmt.setTryBlock(blockStmt);
+                 blockStatement.getStatements().replace(blockStatement.getStatement(index),tryStmt);
+
+             }else if(blockStatement.getStatement(index).isReturnStmt()) {
+                 String block = ""; //getStartSectionOfInstrumentedCodesAsString();
+                 String returnType = method.getType().toString();
+                 String packageName = getPackageName().substring(getPackageName().lastIndexOf('.') + 1);
+                // String returnBlock = getReturnInstrumentedCodes(blockStatement.getStatement(index).asReturnStmt(),method.getType().toString());
+                 int exitPoint = blockStatement.getStatement(index).getEnd().get().line;
+                 if(isLocalMethod(method)){
+                     if(!returnType.contentEquals("void")) {
+                         String returnValue = blockStatement.getStatement(index).asReturnStmt().getExpression().get().toString();
+                         block += "{\n" +
+                                 "initialWidgetList();\n" +
+                                 "instrumenter.getLocalMehodExitPoint(this,\"" + packageName + "\",\"" +
+                                  activity.getNameAsString() + "\",\"" +
+                                 method.getNameAsString() + "\",widgetList,widgetsNameList,widgetTypeList," + exitPoint +
+                                 ",instrumenter.getReturnBlock(\"" + returnType + "\"," + returnValue + "));\n" +
+                                 "emptyWidgetList();\n" +
+                                 "}\n";
+
+                     }
+                     else
+                         block += "{\n" +
+                                 "initialWidgetList();\n" +
+                                 "instrumenter.getLocalMehodExitPoint(this,\"" + packageName + "\",\"" + activity.getNameAsString() +
+                                 "\",\"" + method.getNameAsString() +"\",widgetList,widgetsNameList,widgetTypeList," + exitPoint +
+                                  ",\"\");\n" +
+                                 "emptyWidgetList();\n" +
+                                 "}\n";
+
+                 }
+                 else{
+                     if(isDialogMethod(method)){
+                         if(!returnType.contentEquals("void")) {
+                             String returnValue = blockStatement.getStatement(index).asReturnStmt().getExpression().get().toString();
+                             block += "{\n" +
+                                     "initialWidgetList();\n" +
+                                     "instrumenter.getDialogMethodExitPoint(" + activity.getNameAsString() + ".this,\"" +
+                                     packageName + "\",\"" + activity.getNameAsString() + "\",dialog,\"" +
+                                     getDialogMethodSignature(method) + "\",widgetList,widgetsNameList,widgetTypeList,tmpWidgetList,tmpWidgetsNameList,tmpWidgetTypeList" +
+                                     ",whichButton," + exitPoint + ",instrumenter.getReturnBlock(\"" + returnType + "\"," + returnValue + "));\n" +
+                                     "emptyWidgetList();" +
+                                     "}\n";
+                         }
+                         else
+                             block += "{\n" +
+                                     "initialWidgetList();\n" +
+                                     "instrumenter.getDialogMethodExitPoint(" + activity.getNameAsString() + ".this,\"" +
+                                     packageName + "\",\"" + activity.getNameAsString() + "\",dialog,\"" + getDialogMethodSignature(method) +
+                                     "\",widgetList,widgetsNameList,widgetTypeList,tmpWidgetList,tmpWidgetsNameList,tmpWidgetTypeList" +
+                                     ",whichButton," + exitPoint +  ",\"\");\n" +
+                                     "emptyWidgetList();" +
+                                     "}\n";
+
+                     }
+                     else{
+                         if(!returnType.contentEquals("void")) {
+                             String returnValue = blockStatement.getStatement(index).asReturnStmt().getExpression().get().toString();
+                             block += "{\n" +
+                                     "initialWidgetList();\n" +
+                                     "instrumenter.getLocalMehodExitPoint(" + activity.getNameAsString() + ".this,\"" +
+                                     packageName + "\",\"" + activity.getNameAsString() + "\",\"" +
+                                     getInnerMethodSignature(method) + "\"," +
+                                     "widgetList,widgetsNameList,widgetTypeList," + exitPoint +
+                                     ",instrumenter.getReturnBlock(\"" + returnType + "\"," + returnValue + "));\n" +
+                                     "emptyWidgetList();" +
+                                     "}\n";
+                         }
+                         else
+                             block += "{\n" +
+                                     "initialWidgetList();\n" +
+                                     "instrumenter.getLocalMehodExitPoint(" + activity.getNameAsString() + ".this,\"" +
+                                     packageName + "\",\"" + activity.getNameAsString() + "\",\"" +
+                                     getInnerMethodSignature(method) + "\"," +
+                                     "widgetList,widgetsNameList,widgetTypeList," + exitPoint +
+                                     ",\"\");\n" +
+                                     "emptyWidgetList();" +
+                                     "}\n";
+
+                     }
+                 }
+
+                 blockStmt = StaticJavaParser.parseBlock(block);
+                 blockStmt.addStatement(blockStatement.getStatement(index));
+                 blockStatement.getStatements().replace(blockStatement.getStatement(index),(Statement) blockStmt);
+                 break;
+             }
+        }
+
+        return blockStatement;
+    }
+
+    private String getLocalMethodSignatureInExitPoint(String activityName, MethodDeclaration method, int index) {
+        String block = "\t\tfwriter.append(\"\\nppt " + activityName + "." +
+                method.getNameAsString() + "():::Exit" + index + "\\n\");\n";
+        return block;
+    }
+
+    private String getInnerMethodSignatureInExitPoint(String activityName, MethodDeclaration method, int index) {
+        String block;
+        block = "fwriter.append(\"ppt " + activityName.toString() + ".";
+        Node tmpNode = (Node) method;
+        while (!tmpNode.getParentNode().get().getClass().toString().contains("MethodCallExpr"))
+            tmpNode = tmpNode.getParentNode().get();
+        tmpNode = tmpNode.getParentNode().get();
+        MethodCallExpr expr = (MethodCallExpr) tmpNode;
+        String methodName = expr.getScope().get().toString();
+        block += methodName;
+        block += "_" + expr.getNameAsString().substring(expr.getNameAsString().indexOf('O'), expr.getNameAsString().lastIndexOf('L'));
+        block += "():::Exit" + index + "\\n\");\n";
+        return block;
+    }
+
+    private String getDialogMethodSignatureInExitPoint(String activityName, MethodDeclaration method, int index) {
+        String label = extractLabelForDialogMethod(method);
+        String block;
+        block = "\t\tint flag = " + method.getParameter(1).getNameAsString() + ";\n";
+        block += "\t\tif(flag == -1)\n";
+        block += "\t\t\tfwriter.append(\"\\nppt " + activityName + "$" + label +
+                "Dialog.ConfirmButton_onClick():::Exit" + index + "\\n\");\n";
+        block += "\t\t else if(flag == -2) \n";
+        block += "\t\t\t fwriter.append(\"\\nppt " + activityName + "$" + label +
+                "Dialog.CancelButton_onClick():::Exit" + index + "\\n\");\n";
+        return block;
+    }
+
+
+    private BlockStmt convertStatmentToBlockStatement(Statement statement) {
+        return StaticJavaParser.parseBlock("{\n" + statement.toString() + "\n}");
+    }
+
+    private BlockStmt getInstrumentedStatementsAsString(String activityName, MethodDeclaration method) {
+        BlockStmt blockStmt = new BlockStmt();
+        int index = 0;
+        String block =
+                "{\n\t" +
+                        "int index = 0;\n" +
+                        "WidgetInfoExtrctor widgetInfoExtractor = new WidgetInfoExtrctor();\n\t" +
+                        "initialWidgetList();\n\t" +
+                        "File filePath = new File(Environment.getExternalStorageDirectory(),\"MyData\");\n\t" +
+                        "if(!filePath.exists())\n\t\t" +
+                        "filePath.mkdirs();\n\t" +
+                        "File traceFile = new File(filePath,\"_traceData.txt\");\n\t" +
+                        "FileWriter fwriter = null;\n\t" +
+                        "try{\n" +
+                        "\t\tfwriter = new FileWriter(traceFile,true);\n";
+                        if(!isInnerMethod(method))
+                            block += "\t\tfwriter.append(\"\\nppt " + activityName + "." +
+                                     method.getNameAsString() + "():::Enter\\n\");\n";
+                        else
+                            block += getInnerMethodSignature(activityName,method);
+                block += "\t\tif(this != null){\n" +
+                           "\t\t\tfwriter.append(\"this\\n\");\n" +
+                           "\t\t\tfwriter.append(this.hashCode() +\"\\n\");\n" +
+                        "\t\t}\n" +
+                        "\t\tfor(View viewItem : widgetList)\n" +
+                               "\t\t\tfwriter.append(widgetInfoExtractor.captureWidgetInfo(viewItem," + "\""+ activityName + "\"" + "," +
+                                            "widgetTypeList.get(index++)" +"));\n" +
+                        "\t\tfwriter.flush();\n" +
+                        "\t\tfwriter.close();\n" +
+                        "\t} catch(IOException ioe){\n" +
+                            "\t\t\tioe.printStackTrace();" +
+                        "\n\t}\n" +
+                        "\temptyWidgetList();\n" +
+                "}";
+
+         return StaticJavaParser.parseBlock(block);
+    }
+
+    private boolean isInnerMethod(MethodDeclaration method) {
+        if (!method.getParameter(0).getType().toString().contentEquals("DialogInterface"))
+            return true;
+        else
+            return false;
+    }
+
+    private String getInnerMethodSignature(String activityName, MethodDeclaration method) {
+        String result = "";
+        String dialogTitle = "", dialogMessage = "";
+        StringValueExtractor stringValueExtractor = new StringValueExtractor(
+                projectInformation.getValuesDirectory().getCanonicalPath().toString() + "/" + this.valuesFileName + ".xml");
+        if (!method.getParameter(0).getType().toString().contentEquals("DialogInterface")) {
+            result += "fwriter.append(\"ppt " + activityName.toString() + ".";
+            Node tmpNode = (Node) method;
+            while (!tmpNode.getParentNode().get().getClass().toString().contains("MethodCallExpr"))
+                tmpNode = tmpNode.getParentNode().get();
+            tmpNode = tmpNode.getParentNode().get();
+            MethodCallExpr expr = (MethodCallExpr) tmpNode;
+            String methodName = expr.getScope().get().toString();
+            result += methodName;
+            result += "_" + expr.getNameAsString().substring(expr.getNameAsString().indexOf('O'), expr.getNameAsString().lastIndexOf('L'));
+            result += "():::Enter\\n\");\n";
+        } else {
+
+            Node tmpNode = (Node) method.getParentNode().get();
+            while (!tmpNode.getClass().toString().contains("MethodDeclaration"))
+                tmpNode = tmpNode.getParentNode().get();
+            final MethodDeclaration methodDeclaration = (MethodDeclaration) tmpNode;
+            List<MethodCallExpr> callExprs = new ArrayList<>();
+            tmpNode.findAll(MethodCallExpr.class).forEach(node -> {
+                if (node.getNameAsString().contentEquals("setTitle") || node.getNameAsString().contentEquals("setMessage"))
+                    callExprs.add(node);
+            });
+
+            for (MethodCallExpr expr : callExprs) {
+                if (expr.getNameAsString().contentEquals("setTitle")) {
+                    String objectName = expr.getScope().get().toString();
+                    String containingClassName = resolveClassName(methodDeclaration, objectName);
+                    if (containingClassName.contains("Dialog")) {
+                        if (expr.getArgument(0).toString().startsWith("R.string."))
+                            dialogTitle = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                        else {
+                             dialogTitle = expr.getArgument(0).toString();
+                             dialogTitle = dialogTitle.substring(1,dialogTitle.length()-1);
+                        }
+
+                    }
+                } else if (expr.getNameAsString().contentEquals("setMessage")) {
+                    String objectName = expr.getScope().get().toString();
+                    String containingClassName = resolveClassName(methodDeclaration, objectName);
+                    if (containingClassName.contains("Dialog")) {
+                        if (expr.getArgument(0).toString().startsWith("R.string."))
+                            dialogMessage = stringValueExtractor.findViewLabelById(expr.getArgument(0).toString());
+                        else{
+                            dialogMessage = expr.getArgument(0).toString();
+                            dialogMessage = dialogMessage.substring(1,dialogMessage.length()-1);
+
+                        }
+                    }
+                }
+            }
+            POSTagger posTagger = new POSTagger();
+            String label = "";
+            if (dialogTitle != "")
+                label = posTagger.generateLabelforDialog("I want to " + dialogTitle.toLowerCase());
+            else if (dialogMessage != "")
+                label = posTagger.generateLabelforDialog(dialogTitle);
+
+            result +="\t\tint flag = " + method.getParameter(1).getNameAsString() + ";\n";
+            result +="\t\tif(flag == -1)\n";
+            result += "\t\t\tfwriter.append(\"\\nppt " + activityName + "$" + label +
+                    "Dialog.ConfirmButton_onClick():::Enter\\n\");\n";
+            result +="\t\t else if(flag == -2) \n";
+            result +="\t\t\t fwriter.append(\"\\nppt " + activityName + "$" + label +
+                    "Dialog.CancelButton_onClick():::Enter\\n\");\n";
+        }
+            return result;
+    }
+
+    public String resolveClassName(MethodDeclaration callerMethod, String objectName) {
+        List<VariableDeclarator> localVariablesList;
+        MethodDeclaration involvedMethod = callerMethod;
+
+        if(objectName.contains("."))
+            objectName = objectName.substring(0,objectName.indexOf('.'));
+
+        do{
+            localVariablesList = getLocalVariables(involvedMethod);
+
+            if(isLocalVariable(localVariablesList,objectName))
+                return getContainingClassName(localVariablesList,objectName);
+
+
+            involvedMethod = getParentBlock(involvedMethod);
+
+        }while(involvedMethod != null);
+
+        List<VariableDeclarator> globalVariablesList = getGlobalVariableList();
+        if(isGlobalVariable(globalVariablesList,objectName))
+            return getContainingClassName(globalVariablesList,objectName);
+
+        return "";
+
+    }
+
+    private String getContainingClassName(List<VariableDeclarator> variablesList, String objectName) {
+
+        for(VariableDeclarator variable : variablesList)
+            if(variable.getName().toString().equals(objectName)){
+                return variable.getType().toString();
+            }
+        return "";
+    }
+
+    private boolean isLocalVariable(List<VariableDeclarator> localVariablesList, String objectName){
+        return isExistVariableInSet(localVariablesList,objectName);
+    }
+
+    private boolean isGlobalVariable(List<VariableDeclarator> globalVariablesList, String objectName) {
+        return isExistVariableInSet(globalVariablesList,objectName);
+    }
+
+
+    private boolean isExistVariableInSet(List<VariableDeclarator> variablesSet, String objectName){
+        boolean result = false;
+        if(objectName.contains("."))
+            objectName = objectName.substring(0,objectName.indexOf('.'));
+        for(VariableDeclarator variable : variablesSet)
+            if(variable.getName().toString().equals(objectName)){
+                result = true;
+            }
+        return result;
+    }
+
+    private List<VariableDeclarator> getLocalVariables(MethodDeclaration callerMethod) {
+        List<VariableDeclarator> localVariablesList = new ArrayList<>();
+        callerMethod.findAll(VariableDeclarator.class).forEach(item->{
+            Node tmpNode = (Node) item;
+            while(!tmpNode.getParentNode().get().getClass().getName().contains("MethodDeclaration"))
+                tmpNode = tmpNode.getParentNode().get();
+            if(!callerMethod.isAncestorOf(tmpNode.getParentNode().get()))
+                localVariablesList.add(item);
+
+        });
+
+        return localVariablesList;
+    }
+
+    private List<VariableDeclarator> getGlobalVariableList() {
+        List<FieldDeclaration> fieldsList= new ArrayList<>();
+        List<VariableDeclarator> globalVariablesList = new ArrayList<>();
+        root.findAll(FieldDeclaration.class).forEach(item->fieldsList.add(item));
+        for(FieldDeclaration field:fieldsList)
+            for(int i = 0; i<field.getVariables().size();i++)
+                globalVariablesList.add(field.getVariable(i));
+
+        return globalVariablesList;
+    }
+
+    private MethodDeclaration getParentBlock(MethodDeclaration method){
+        MethodDeclaration parentBlock = null;
+        Node tmpNode = (Node) method;
+        do{
+
+            tmpNode = tmpNode.getParentNode().get();
+            //String className = tmpNode.getClass().getName();
+            if(tmpNode.getClass().getName().contains("MethodDeclaration")){
+                parentBlock = (MethodDeclaration) tmpNode;
+                break;
+            }
+        }while(!tmpNode.getClass().getName().contains("ClassOrInterfaceDeclaration"));
+        return parentBlock;
+    }
+
+    private void appendCallingOfInstrumentedMethodInConstructor(ConstructorDeclaration constructor,
+                                                                String packageName,String activityName,
+                                                                String initialWidgetList,
+                                                                String emptyWidgetList,
+                                                                int exitPoint) {
+        String stmt ="{\n" +
+                            "instrumenter = new Instrumenter();" +
+                             initialWidgetList +"();\n" +
+                            "instrumenter.constructor(this,\"" + packageName + "\",\"" + activityName + "\",widgetList,widgetsNameList," +
+                             "widgetTypeList," + exitPoint + ");" +
+                            emptyWidgetList +"();\n" +
+                       "}" ;
+        BlockStmt blockstatement = StaticJavaParser.parseBlock(stmt);
+        for(Statement statement : blockstatement.getStatements())
+            constructor.getBody().addStatement(statement);
+    }
+
+    private ConstructorDeclaration createInstrumentedConstructorMethodForActivityClass(
+            TypeDeclaration activityClass) {
+        int index = 0;
+
+        ConstructorDeclaration constrcutor = activityClass.addConstructor(Modifier.Keyword.PUBLIC);
+//        ConstructorDeclaration constrcutor = new ConstructorDeclaration();
+//        constrcutor.addModifier(Modifier.Keyword.PUBLIC);
+        constrcutor.setName(activityClass.getName().toString());
+        //activityClass.getMethods().add(0,(Object) constrcutor);
+        // The following codes instrument clling super class constructor
+
+        String stmt = "super();";
+        Statement statement = StaticJavaParser.parseStatement(stmt);
+        constrcutor.getBody().addStatement(index, statement);
+
+        return constrcutor;
+    }
+
+    private MethodDeclaration createInitailWidgetListMethodForActivityClass(TypeDeclaration activityClass){
+        int index = 0;
+        String blockStmt = "";
+        Statement statement;
+        MethodDeclaration instrumentedMethod = activityClass.addMethod(
+                "initialWidgetList", Modifier.Keyword.PRIVATE);
+        for(Object field : activityClass.getFields()){
+            for(VariableDeclarator variable : ((FieldDeclaration) field).getVariables())
+                if(Utils.isWidget(variable.getType().toString())) {
+                    widgetList.add(variable.getType().toString());
+                    blockStmt = "{" +
+                                    "widgetList.add((View)" + variable.getName() + ");\n" +
+                                    "widgetTypeList.add(\"" + variable.getType().toString() + "\");\n" +
+                                    "widgetsNameList.add(\"" + variable.getNameAsString() + "\");\n" +
+                                "}";
+                    BlockStmt blockStatement = StaticJavaParser.parseBlock(blockStmt);
+                    for(Statement stmt : blockStatement.getStatements() )
+                         instrumentedMethod.getBody().get().addStatement(index++, stmt);
+                }
+
+
+        }
+        return instrumentedMethod;
+    }
+
+    private MethodDeclaration createEmptyWidgetListMethodForActivityClass(TypeDeclaration activityClass) {
+        int index = 0;
+        String stmt = "";
+        Statement statement;
+        MethodDeclaration instrumentedMethod = activityClass.addMethod(
+                "emptyWidgetList", Modifier.Keyword.PRIVATE);
+        stmt = "widgetList.clear();";
+        statement = StaticJavaParser.parseStatement(stmt);
+        instrumentedMethod.getBody().get().addStatement(index++, statement);
+
+        stmt = "widgetTypeList.clear();";
+        statement = StaticJavaParser.parseStatement(stmt);
+        instrumentedMethod.getBody().get().addStatement(index++, statement);
+        return instrumentedMethod;
+    }
+
+    private void instrumentFieldsInActivityClass(TypeDeclaration node) {
+        FieldDeclaration fieldDeclaration = new FieldDeclaration();
+        VariableDeclarator variableDeclarator = new VariableDeclarator();
+        variableDeclarator.setName("widgetList");
+        variableDeclarator.setType("List<View>");
+        variableDeclarator.setInitializer("new ArrayList<>()");
+        fieldDeclaration.getVariables().add(variableDeclarator);
+        fieldDeclaration.setModifiers(Modifier.Keyword.PRIVATE);
+        node.getMembers().add(0,fieldDeclaration);
+
+        fieldDeclaration = new FieldDeclaration();
+        variableDeclarator = new VariableDeclarator();
+        variableDeclarator.setName("widgetTypeList");
+        variableDeclarator.setType("List<String>");
+        variableDeclarator.setInitializer("new ArrayList<>()");
+        fieldDeclaration.getVariables().add(variableDeclarator);
+        fieldDeclaration.setModifiers(Modifier.Keyword.PRIVATE);
+        node.getMembers().add(1,fieldDeclaration);
+
+        fieldDeclaration = new FieldDeclaration();
+        variableDeclarator = new VariableDeclarator();
+        variableDeclarator.setName("widgetsNameList");
+        variableDeclarator.setType("List<String>");
+        variableDeclarator.setInitializer("new ArrayList<>()");
+        fieldDeclaration.getVariables().add(variableDeclarator);
+        fieldDeclaration.setModifiers(Modifier.Keyword.PRIVATE);
+        node.getMembers().add(2,fieldDeclaration);
+
+        fieldDeclaration = new FieldDeclaration();
+        variableDeclarator = new VariableDeclarator();
+        variableDeclarator.setName("instrumenter");
+        variableDeclarator.setType("Instrumenter");
+        fieldDeclaration.getVariables().add(variableDeclarator);
+        fieldDeclaration.setModifiers(Modifier.Keyword.PRIVATE);
+        node.getMembers().add(3,fieldDeclaration);
+
+
+    }
+
+       public void saveInstrumentedCodes() throws IOException {
+        String context = root.toString();
+        Files.write(new File(classfilePath).toPath(), Collections.singleton(root.toString()),StandardCharsets.UTF_8);
+        int i = 0;
+        i++;
+    }
+}
